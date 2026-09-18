@@ -738,6 +738,10 @@ class PupilProcessor:
         - Creates a new column with suffix appended to the current pupil column name
         - Updates all_pupil_cols and all_steps to track processing history
         - Missing values (NaN) are preserved
+        - The Butterworth filter is applied separately within each contiguous run of
+          non-missing samples, so a NaN gap (e.g. a blink) does not corrupt the filtered
+          signal on either side of it. A run too short for the filter's padding (fewer
+          than 3 * (order + 1) samples) is left as-is (NaN) and reported.
         """
         # store parameters
         self.params['smooth'] = {k:v for k,v in locals().items() if k != 'self'}
@@ -756,10 +760,15 @@ class PupilProcessor:
 
         if method == 'butter' and ('cutoff_freq' not in kwargs or self.samp_freq is None):
             raise ValueError("For Butterworth filter, 'sampling_freq' and 'cutoff_freq' must be specified")
-        
-        if (method == 'butter') and (self.data[pupil_col].isnull().sum() > 0):
-            raise ValueError("Butterworth filter does not support NaN values")
-        
+
+        # scipy's filtfilt needs more samples than this default padding length,
+        # below which a contiguous valid run cannot be safely filtered
+        butter_order = kwargs.get('order', 3)
+        min_run_len = 3 * (butter_order + 1)
+        # sampling_freq is always sourced from self.samp_freq below; drop any
+        # caller-supplied value so it doesn't collide with that explicit kwarg
+        kwargs.pop('sampling_freq', None)
+
         # create new column for smoothed data
         self.data[new_col] = pd.NA
 
@@ -768,6 +777,7 @@ class PupilProcessor:
 
         # iterate over trials if trial_identifier is provided
         empty_trials = []
+        skipped_short_runs = 0
         grouped = self.data.groupby(self.trial_identifier, sort=False)
         for group, groupdata in tqdm(grouped, desc=f'Smoothing', disable=not self.progress_bar):
 
@@ -780,7 +790,20 @@ class PupilProcessor:
                 elif method == 'hann':
                     smoothed = groupdata[pupil_col].rolling(window=window, win_type='hann', center=True, **kwargs).mean()
                 elif method == 'butter':
-                    smoothed = lowpass_filter(groupdata[pupil_col], **kwargs)
+                    # filter each contiguous run of non-missing samples separately, so
+                    # NaN gaps (e.g. blinks) don't corrupt the filtered signal around them
+                    values = groupdata[pupil_col]
+                    is_valid = values.notna()
+                    run_ids = (is_valid != is_valid.shift()).cumsum()
+                    smoothed = pd.Series(np.nan, index=values.index, dtype='float64')
+                    for _, run_valid in is_valid.groupby(run_ids):
+                        if not run_valid.iloc[0]:
+                            continue # missing-data run, leave as NaN
+                        run_index = run_valid.index
+                        if len(run_index) <= min_run_len:
+                            skipped_short_runs += 1
+                            continue # too short to filter safely, leave as NaN
+                        smoothed.loc[run_index] = lowpass_filter(values.loc[run_index], sampling_freq=self.samp_freq, **kwargs)
                 self.data.loc[groupdata.index, new_col] = smoothed
 
                 # update summary data
@@ -805,6 +828,8 @@ class PupilProcessor:
         print(f"  → New column: '{new_col}' (smoothed)")
         print(f"  → Previous column '{pupil_col}' preserved.")
         print(f"  → {len(empty_trials)} trial(s) failed.")
+        if method == 'butter' and skipped_short_runs > 0:
+            print(f"  → {skipped_short_runs} valid run(s) shorter than {min_run_len} samples were left unfiltered (NaN).")
 
         # print empty trials
         if len(empty_trials) > 0:
